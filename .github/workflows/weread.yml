@@ -36,7 +36,7 @@ permissions:
 
 concurrency:
   group: notionhub-weread-sync-${{ github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
   books:
@@ -49,13 +49,31 @@ jobs:
       WEREAD_CONFIG: ${{ secrets.WEREAD_CONFIG }}
       NOTIONHUB_API_BASE: https://i.notionhub.app/v1
       NOTIONHUB_SERVICE: weread
-      NOTIONHUB_CONFIG_VERSION: '51'
+      NOTIONHUB_CONFIG_VERSION: '69'
       SYNC_POLICY_STATE_PATH: ${{ github.workspace }}/notionhub-state.json
       SYNC_POLICY_CONTINUATION_PATH: ${{ github.workspace }}/notionhub-continuation-id
       SYNC_POLICY_REPORT_PATH: ${{ github.workspace }}/notionhub-service-report.json
       NOTIONHUB_RUN_META_PATH: ${{ github.workspace }}/notionhub-run-meta.json
       NOTIONHUB_TARGET_RESULTS_PATH: ${{ github.workspace }}/notionhub-target-results.json
     steps:
+      - name: 清理历史同步临时文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${GITHUB_WORKSPACE:?GitHub workspace is required}"
+          rm -f -- \
+            "$GITHUB_WORKSPACE/notionhub-state.json" \
+            "$GITHUB_WORKSPACE/notionhub-continuation-id" \
+            "$GITHUB_WORKSPACE/notionhub-run-meta.json" \
+            "$GITHUB_WORKSPACE/notionhub-target-results.json" \
+            "$GITHUB_WORKSPACE/notionhub-service-report.json" \
+            "$GITHUB_WORKSPACE/notionhub-final.json"
+          shopt -s nullglob
+          for STAGE_FILE in "$GITHUB_WORKSPACE"/notionhub-stage-*.json; do
+            rm -f -- "$STAGE_FILE"
+          done
+          rm -rf -- "$GITHUB_WORKSPACE/notionhub-artifacts"
+
       - name: 验证运行配置
         id: activation
         env:
@@ -73,19 +91,37 @@ jobs:
         id: authorize
         if: steps.activation.outputs.enabled == 'true'
         run: |
-          OIDC_TOKEN=$(curl -fsSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty')
-          if [ -z "$OIDC_TOKEN" ]; then
-            echo "::error title=GitHub 身份验证失败::未能获取本次运行的 OIDC token。"
-            exit 1
-          fi
-          echo "::add-mask::$OIDC_TOKEN"
           RUNTIME_PAYLOAD='{"service":"weread","purpose":"sync"}'
           RUNTIME_RESPONSE="$RUNNER_TEMP/notionhub-runtime-bundle.bin"
           RUNTIME_METADATA="$RUNNER_TEMP/notionhub-runtime-metadata.json"
           RUNTIME_ARCHIVE="$RUNNER_TEMP/notionhub-runner.tar.gz"
           cleanup_runtime_files() { rm -f "$RUNTIME_RESPONSE" "$RUNTIME_METADATA" "$RUNTIME_ARCHIVE"; }
           trap cleanup_runtime_files EXIT
-          HTTP_STATUS=$(curl -sS -o "$RUNTIME_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/runtime-bundle"             -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' --data "$RUNTIME_PAYLOAD")
+          # GitHub OIDC tokens are single-use at the Worker. Never let a
+          # transport retry reuse a token that may already have been consumed
+          # by a request whose response was lost after the server accepted it.
+          HTTP_STATUS=000
+          for ATTEMPT in 1 2 3 4; do
+            OIDC_TOKEN=$(curl -fsSL --max-time 30 -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty') || OIDC_TOKEN=""
+            if [ -n "$OIDC_TOKEN" ]; then
+              echo "::add-mask::$OIDC_TOKEN"
+              HTTP_STATUS=$(curl -sS --max-time 120 -o "$RUNTIME_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/runtime-bundle"                 -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' --data "$RUNTIME_PAYLOAD") || HTTP_STATUS=000
+              unset OIDC_TOKEN
+            else
+              HTTP_STATUS=000
+            fi
+            case "$HTTP_STATUS" in
+              2??) break ;;
+              408|429|5??|000)
+                if [ "$ATTEMPT" -lt 4 ]; then sleep $((ATTEMPT * 2)); fi
+                ;;
+              4??|*) break ;;
+            esac
+          done
+          if [ "$HTTP_STATUS" = "000" ]; then
+            echo "::error title=运行准备失败::无法获取 GitHub OIDC token 或连接运行服务。"
+            exit 1
+          fi
           if [ "$HTTP_STATUS" = "418" ]; then
             echo "免费体验次数已用完，请购买激活码。"
             echo "获取激活码：https://www.notionhub.app/docs/get-activation-code.html"
@@ -145,6 +181,7 @@ jobs:
           PY
           ACCESS_TOKEN=$(jq -r '.accessToken // empty' "$RUNTIME_METADATA")
           REPORT_TOKEN=$(jq -r '.reportToken // empty' "$RUNTIME_METADATA")
+          CONTINUATION_TOKEN=$(jq -r '.continuationToken // empty' "$RUNTIME_METADATA")
           POLICY_ID=$(jq -r '.context.id // empty' "$RUNTIME_METADATA")
           PLAN=$(jq -r '.context.plan // empty' "$RUNTIME_METADATA")
           POLICY_JSON=$(jq -c '.policy // {}' "$RUNTIME_METADATA")
@@ -152,11 +189,13 @@ jobs:
           SERVICE_CONFIG=$(jq -c '.serviceConfig // empty' "$RUNTIME_METADATA")
           EXPECTED_SIZE=$(jq -r '.bundle.size // empty' "$RUNTIME_METADATA")
           EXPECTED_SHA256=$(jq -r '.bundle.sha256 // empty' "$RUNTIME_METADATA")
-          if [ -z "$ACCESS_TOKEN" ] || [ -z "$REPORT_TOKEN" ] || [ -z "$POLICY_ID" ] || [ -z "$PLAN" ] || [ -z "$POLICY_SIGNATURE" ] || [ -z "$SERVICE_CONFIG" ] || [ -z "$EXPECTED_SIZE" ] || [ -z "$EXPECTED_SHA256" ]; then
+          if [ -z "$ACCESS_TOKEN" ] || [ -z "$REPORT_TOKEN" ] || [ -z "$CONTINUATION_TOKEN" ] || [ -z "$POLICY_ID" ] || [ -z "$PLAN" ] || [ -z "$POLICY_SIGNATURE" ] || [ -z "$SERVICE_CONFIG" ] || [ -z "$EXPECTED_SIZE" ] || [ -z "$EXPECTED_SHA256" ]; then
             echo "::error title=运行准备失败::运行配置缺少必要字段。"
             exit 1
           fi
-          for VALUE in "$ACCESS_TOKEN" "$REPORT_TOKEN" "$POLICY_SIGNATURE" "$SERVICE_CONFIG"; do echo "::add-mask::$VALUE"; done
+          for VALUE in "$ACCESS_TOKEN" "$REPORT_TOKEN" "$CONTINUATION_TOKEN" "$POLICY_SIGNATURE" "$SERVICE_CONFIG"; do echo "::add-mask::$VALUE"; done
+          printf '%s' "$CONTINUATION_TOKEN" > "$SYNC_POLICY_CONTINUATION_PATH"
+          chmod 600 "$SYNC_POLICY_CONTINUATION_PATH"
           python3 - "$RUNTIME_METADATA" <<'PY'
           import json
           import sys
@@ -236,7 +275,6 @@ jobs:
           state = initial if isinstance(initial, dict) else {}
           Path(os.environ['SYNC_POLICY_STATE_PATH']).write_text(json.dumps(state, ensure_ascii=False), encoding='utf-8')
           PY
-          printf '%s' "$NOTIONHUB_POLICY_ID" > "$SYNC_POLICY_CONTINUATION_PATH"
           RAW_CONFIG="${WEREAD_CONFIG:-$SERVICE_CONFIG}"
           SAFE_CONFIG=$(printf '%s' "$RAW_CONFIG" | jq -c '{
             ("WEREAD_SYNC_PLAN"): (."WEREAD_SYNC_PLAN" // null),
@@ -276,7 +314,11 @@ jobs:
           python -m pip install --quiet --disable-pip-version-check --upgrade pip
           if [ -f runner/requirements.txt ]; then pip install --quiet --disable-pip-version-check -r runner/requirements.txt; fi
           SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements weread)
-          if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
+          if [ -f "$SERVICE_REQUIREMENTS" ]; then
+            SERVICE_REQUIREMENTS_DIR=$(dirname "$SERVICE_REQUIREMENTS")
+            SERVICE_REQUIREMENTS_FILE=$(basename "$SERVICE_REQUIREMENTS")
+            (cd "$SERVICE_REQUIREMENTS_DIR" && pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS_FILE")
+          fi
 
 
       - name: 同步书籍
@@ -371,13 +413,31 @@ jobs:
       WEREAD_CONFIG: ${{ secrets.WEREAD_CONFIG }}
       NOTIONHUB_API_BASE: https://i.notionhub.app/v1
       NOTIONHUB_SERVICE: weread
-      NOTIONHUB_CONFIG_VERSION: '51'
+      NOTIONHUB_CONFIG_VERSION: '69'
       SYNC_POLICY_STATE_PATH: ${{ github.workspace }}/notionhub-state.json
       SYNC_POLICY_CONTINUATION_PATH: ${{ github.workspace }}/notionhub-continuation-id
       SYNC_POLICY_REPORT_PATH: ${{ github.workspace }}/notionhub-service-report.json
       NOTIONHUB_RUN_META_PATH: ${{ github.workspace }}/notionhub-run-meta.json
       NOTIONHUB_TARGET_RESULTS_PATH: ${{ github.workspace }}/notionhub-target-results.json
     steps:
+      - name: 清理历史同步临时文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${GITHUB_WORKSPACE:?GitHub workspace is required}"
+          rm -f -- \
+            "$GITHUB_WORKSPACE/notionhub-state.json" \
+            "$GITHUB_WORKSPACE/notionhub-continuation-id" \
+            "$GITHUB_WORKSPACE/notionhub-run-meta.json" \
+            "$GITHUB_WORKSPACE/notionhub-target-results.json" \
+            "$GITHUB_WORKSPACE/notionhub-service-report.json" \
+            "$GITHUB_WORKSPACE/notionhub-final.json"
+          shopt -s nullglob
+          for STAGE_FILE in "$GITHUB_WORKSPACE"/notionhub-stage-*.json; do
+            rm -f -- "$STAGE_FILE"
+          done
+          rm -rf -- "$GITHUB_WORKSPACE/notionhub-artifacts"
+
       - name: 恢复上一阶段进度
         id: restore
         if: needs.books.outputs.enabled == 'true' && needs.books.result == 'success'
@@ -490,24 +550,42 @@ jobs:
         id: authorize
         if: steps.job_config.outputs.enabled == 'true'
         run: |
-          OIDC_TOKEN=$(curl -fsSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty')
-          if [ -z "$OIDC_TOKEN" ]; then
-            echo "::error title=GitHub 身份验证失败::未能获取本次运行的 OIDC token。"
-            exit 1
-          fi
-          echo "::add-mask::$OIDC_TOKEN"
-          CONTINUATION_ID="$(cat "$SYNC_POLICY_CONTINUATION_PATH")"
-          if [ -z "$CONTINUATION_ID" ]; then
+          CONTINUATION_TOKEN="$(cat "$SYNC_POLICY_CONTINUATION_PATH")"
+          if [ -z "$CONTINUATION_TOKEN" ]; then
             echo "::error title=运行授权续接失败::同步进度中缺少续接标识。"
             exit 1
           fi
-          RUNTIME_PAYLOAD=$(jq -cn --arg service "weread" --arg continuation "$CONTINUATION_ID" '{service:$service,purpose:"sync",continuationPolicyId:$continuation}')
+          RUNTIME_PAYLOAD=$(jq -cn --arg service "weread" --arg continuation "$CONTINUATION_TOKEN" '{service:$service,purpose:"sync",continuationToken:$continuation}')
           RUNTIME_RESPONSE="$RUNNER_TEMP/notionhub-runtime-bundle.bin"
           RUNTIME_METADATA="$RUNNER_TEMP/notionhub-runtime-metadata.json"
           RUNTIME_ARCHIVE="$RUNNER_TEMP/notionhub-runner.tar.gz"
           cleanup_runtime_files() { rm -f "$RUNTIME_RESPONSE" "$RUNTIME_METADATA" "$RUNTIME_ARCHIVE"; }
           trap cleanup_runtime_files EXIT
-          HTTP_STATUS=$(curl -sS -o "$RUNTIME_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/runtime-bundle"             -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' --data "$RUNTIME_PAYLOAD")
+          # GitHub OIDC tokens are single-use at the Worker. Never let a
+          # transport retry reuse a token that may already have been consumed
+          # by a request whose response was lost after the server accepted it.
+          HTTP_STATUS=000
+          for ATTEMPT in 1 2 3 4; do
+            OIDC_TOKEN=$(curl -fsSL --max-time 30 -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty') || OIDC_TOKEN=""
+            if [ -n "$OIDC_TOKEN" ]; then
+              echo "::add-mask::$OIDC_TOKEN"
+              HTTP_STATUS=$(curl -sS --max-time 120 -o "$RUNTIME_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/runtime-bundle"                 -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' --data "$RUNTIME_PAYLOAD") || HTTP_STATUS=000
+              unset OIDC_TOKEN
+            else
+              HTTP_STATUS=000
+            fi
+            case "$HTTP_STATUS" in
+              2??) break ;;
+              408|429|5??|000)
+                if [ "$ATTEMPT" -lt 4 ]; then sleep $((ATTEMPT * 2)); fi
+                ;;
+              4??|*) break ;;
+            esac
+          done
+          if [ "$HTTP_STATUS" = "000" ]; then
+            echo "::error title=运行准备失败::无法获取 GitHub OIDC token 或连接运行服务。"
+            exit 1
+          fi
           if [ "$HTTP_STATUS" = "418" ]; then
             echo "免费体验次数已用完，请购买激活码。"
             echo "获取激活码：https://www.notionhub.app/docs/get-activation-code.html"
@@ -567,6 +645,7 @@ jobs:
           PY
           ACCESS_TOKEN=$(jq -r '.accessToken // empty' "$RUNTIME_METADATA")
           REPORT_TOKEN=$(jq -r '.reportToken // empty' "$RUNTIME_METADATA")
+          CONTINUATION_TOKEN=$(jq -r '.continuationToken // empty' "$RUNTIME_METADATA")
           POLICY_ID=$(jq -r '.context.id // empty' "$RUNTIME_METADATA")
           PLAN=$(jq -r '.context.plan // empty' "$RUNTIME_METADATA")
           POLICY_JSON=$(jq -c '.policy // {}' "$RUNTIME_METADATA")
@@ -574,11 +653,13 @@ jobs:
           SERVICE_CONFIG=$(jq -c '.serviceConfig // empty' "$RUNTIME_METADATA")
           EXPECTED_SIZE=$(jq -r '.bundle.size // empty' "$RUNTIME_METADATA")
           EXPECTED_SHA256=$(jq -r '.bundle.sha256 // empty' "$RUNTIME_METADATA")
-          if [ -z "$ACCESS_TOKEN" ] || [ -z "$REPORT_TOKEN" ] || [ -z "$POLICY_ID" ] || [ -z "$PLAN" ] || [ -z "$POLICY_SIGNATURE" ] || [ -z "$SERVICE_CONFIG" ] || [ -z "$EXPECTED_SIZE" ] || [ -z "$EXPECTED_SHA256" ]; then
+          if [ -z "$ACCESS_TOKEN" ] || [ -z "$REPORT_TOKEN" ] || [ -z "$CONTINUATION_TOKEN" ] || [ -z "$POLICY_ID" ] || [ -z "$PLAN" ] || [ -z "$POLICY_SIGNATURE" ] || [ -z "$SERVICE_CONFIG" ] || [ -z "$EXPECTED_SIZE" ] || [ -z "$EXPECTED_SHA256" ]; then
             echo "::error title=运行准备失败::运行配置缺少必要字段。"
             exit 1
           fi
-          for VALUE in "$ACCESS_TOKEN" "$REPORT_TOKEN" "$POLICY_SIGNATURE" "$SERVICE_CONFIG"; do echo "::add-mask::$VALUE"; done
+          for VALUE in "$ACCESS_TOKEN" "$REPORT_TOKEN" "$CONTINUATION_TOKEN" "$POLICY_SIGNATURE" "$SERVICE_CONFIG"; do echo "::add-mask::$VALUE"; done
+          printf '%s' "$CONTINUATION_TOKEN" > "$SYNC_POLICY_CONTINUATION_PATH"
+          chmod 600 "$SYNC_POLICY_CONTINUATION_PATH"
           python3 - "$RUNTIME_METADATA" <<'PY'
           import json
           import sys
@@ -631,7 +712,11 @@ jobs:
           python -m pip install --quiet --disable-pip-version-check --upgrade pip
           if [ -f runner/requirements.txt ]; then pip install --quiet --disable-pip-version-check -r runner/requirements.txt; fi
           SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements weread)
-          if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
+          if [ -f "$SERVICE_REQUIREMENTS" ]; then
+            SERVICE_REQUIREMENTS_DIR=$(dirname "$SERVICE_REQUIREMENTS")
+            SERVICE_REQUIREMENTS_FILE=$(basename "$SERVICE_REQUIREMENTS")
+            (cd "$SERVICE_REQUIREMENTS_DIR" && pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS_FILE")
+          fi
 
 
       - name: 同步阅读时长
@@ -726,13 +811,31 @@ jobs:
       WEREAD_CONFIG: ${{ secrets.WEREAD_CONFIG }}
       NOTIONHUB_API_BASE: https://i.notionhub.app/v1
       NOTIONHUB_SERVICE: weread
-      NOTIONHUB_CONFIG_VERSION: '51'
+      NOTIONHUB_CONFIG_VERSION: '69'
       SYNC_POLICY_STATE_PATH: ${{ github.workspace }}/notionhub-state.json
       SYNC_POLICY_CONTINUATION_PATH: ${{ github.workspace }}/notionhub-continuation-id
       SYNC_POLICY_REPORT_PATH: ${{ github.workspace }}/notionhub-service-report.json
       NOTIONHUB_RUN_META_PATH: ${{ github.workspace }}/notionhub-run-meta.json
       NOTIONHUB_TARGET_RESULTS_PATH: ${{ github.workspace }}/notionhub-target-results.json
     steps:
+      - name: 清理历史同步临时文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${GITHUB_WORKSPACE:?GitHub workspace is required}"
+          rm -f -- \
+            "$GITHUB_WORKSPACE/notionhub-state.json" \
+            "$GITHUB_WORKSPACE/notionhub-continuation-id" \
+            "$GITHUB_WORKSPACE/notionhub-run-meta.json" \
+            "$GITHUB_WORKSPACE/notionhub-target-results.json" \
+            "$GITHUB_WORKSPACE/notionhub-service-report.json" \
+            "$GITHUB_WORKSPACE/notionhub-final.json"
+          shopt -s nullglob
+          for STAGE_FILE in "$GITHUB_WORKSPACE"/notionhub-stage-*.json; do
+            rm -f -- "$STAGE_FILE"
+          done
+          rm -rf -- "$GITHUB_WORKSPACE/notionhub-artifacts"
+
       - name: 恢复上一阶段进度
         id: restore
         if: needs.books.outputs.enabled == 'true' && needs.reading_time.result == 'success'
@@ -869,24 +972,42 @@ jobs:
         continue-on-error: true
         if: steps.job_config.outputs.enabled == 'true'
         run: |
-          OIDC_TOKEN=$(curl -fsSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty')
-          if [ -z "$OIDC_TOKEN" ]; then
-            echo "::error title=GitHub 身份验证失败::未能获取本次运行的 OIDC token。"
-            exit 1
-          fi
-          echo "::add-mask::$OIDC_TOKEN"
-          CONTINUATION_ID="$(cat "$SYNC_POLICY_CONTINUATION_PATH")"
-          if [ -z "$CONTINUATION_ID" ]; then
+          CONTINUATION_TOKEN="$(cat "$SYNC_POLICY_CONTINUATION_PATH")"
+          if [ -z "$CONTINUATION_TOKEN" ]; then
             echo "::error title=运行授权续接失败::同步进度中缺少续接标识。"
             exit 1
           fi
-          RUNTIME_PAYLOAD=$(jq -cn --arg service "weread" --arg continuation "$CONTINUATION_ID" '{service:$service,purpose:"sync",continuationPolicyId:$continuation}')
+          RUNTIME_PAYLOAD=$(jq -cn --arg service "weread" --arg continuation "$CONTINUATION_TOKEN" '{service:$service,purpose:"sync",continuationToken:$continuation}')
           RUNTIME_RESPONSE="$RUNNER_TEMP/notionhub-runtime-bundle.bin"
           RUNTIME_METADATA="$RUNNER_TEMP/notionhub-runtime-metadata.json"
           RUNTIME_ARCHIVE="$RUNNER_TEMP/notionhub-runner.tar.gz"
           cleanup_runtime_files() { rm -f "$RUNTIME_RESPONSE" "$RUNTIME_METADATA" "$RUNTIME_ARCHIVE"; }
           trap cleanup_runtime_files EXIT
-          HTTP_STATUS=$(curl -sS -o "$RUNTIME_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/runtime-bundle"             -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' --data "$RUNTIME_PAYLOAD")
+          # GitHub OIDC tokens are single-use at the Worker. Never let a
+          # transport retry reuse a token that may already have been consumed
+          # by a request whose response was lost after the server accepted it.
+          HTTP_STATUS=000
+          for ATTEMPT in 1 2 3 4; do
+            OIDC_TOKEN=$(curl -fsSL --max-time 30 -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty') || OIDC_TOKEN=""
+            if [ -n "$OIDC_TOKEN" ]; then
+              echo "::add-mask::$OIDC_TOKEN"
+              HTTP_STATUS=$(curl -sS --max-time 120 -o "$RUNTIME_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/runtime-bundle"                 -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' --data "$RUNTIME_PAYLOAD") || HTTP_STATUS=000
+              unset OIDC_TOKEN
+            else
+              HTTP_STATUS=000
+            fi
+            case "$HTTP_STATUS" in
+              2??) break ;;
+              408|429|5??|000)
+                if [ "$ATTEMPT" -lt 4 ]; then sleep $((ATTEMPT * 2)); fi
+                ;;
+              4??|*) break ;;
+            esac
+          done
+          if [ "$HTTP_STATUS" = "000" ]; then
+            echo "::error title=运行准备失败::无法获取 GitHub OIDC token 或连接运行服务。"
+            exit 1
+          fi
           if [ "$HTTP_STATUS" = "418" ]; then
             echo "免费体验次数已用完，请购买激活码。"
             echo "获取激活码：https://www.notionhub.app/docs/get-activation-code.html"
@@ -946,6 +1067,7 @@ jobs:
           PY
           ACCESS_TOKEN=$(jq -r '.accessToken // empty' "$RUNTIME_METADATA")
           REPORT_TOKEN=$(jq -r '.reportToken // empty' "$RUNTIME_METADATA")
+          CONTINUATION_TOKEN=$(jq -r '.continuationToken // empty' "$RUNTIME_METADATA")
           POLICY_ID=$(jq -r '.context.id // empty' "$RUNTIME_METADATA")
           PLAN=$(jq -r '.context.plan // empty' "$RUNTIME_METADATA")
           POLICY_JSON=$(jq -c '.policy // {}' "$RUNTIME_METADATA")
@@ -953,11 +1075,13 @@ jobs:
           SERVICE_CONFIG=$(jq -c '.serviceConfig // empty' "$RUNTIME_METADATA")
           EXPECTED_SIZE=$(jq -r '.bundle.size // empty' "$RUNTIME_METADATA")
           EXPECTED_SHA256=$(jq -r '.bundle.sha256 // empty' "$RUNTIME_METADATA")
-          if [ -z "$ACCESS_TOKEN" ] || [ -z "$REPORT_TOKEN" ] || [ -z "$POLICY_ID" ] || [ -z "$PLAN" ] || [ -z "$POLICY_SIGNATURE" ] || [ -z "$SERVICE_CONFIG" ] || [ -z "$EXPECTED_SIZE" ] || [ -z "$EXPECTED_SHA256" ]; then
+          if [ -z "$ACCESS_TOKEN" ] || [ -z "$REPORT_TOKEN" ] || [ -z "$CONTINUATION_TOKEN" ] || [ -z "$POLICY_ID" ] || [ -z "$PLAN" ] || [ -z "$POLICY_SIGNATURE" ] || [ -z "$SERVICE_CONFIG" ] || [ -z "$EXPECTED_SIZE" ] || [ -z "$EXPECTED_SHA256" ]; then
             echo "::error title=运行准备失败::运行配置缺少必要字段。"
             exit 1
           fi
-          for VALUE in "$ACCESS_TOKEN" "$REPORT_TOKEN" "$POLICY_SIGNATURE" "$SERVICE_CONFIG"; do echo "::add-mask::$VALUE"; done
+          for VALUE in "$ACCESS_TOKEN" "$REPORT_TOKEN" "$CONTINUATION_TOKEN" "$POLICY_SIGNATURE" "$SERVICE_CONFIG"; do echo "::add-mask::$VALUE"; done
+          printf '%s' "$CONTINUATION_TOKEN" > "$SYNC_POLICY_CONTINUATION_PATH"
+          chmod 600 "$SYNC_POLICY_CONTINUATION_PATH"
           python3 - "$RUNTIME_METADATA" <<'PY'
           import json
           import sys
@@ -1012,7 +1136,11 @@ jobs:
           python -m pip install --quiet --disable-pip-version-check --upgrade pip
           if [ -f runner/requirements.txt ]; then pip install --quiet --disable-pip-version-check -r runner/requirements.txt; fi
           SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements weread)
-          if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
+          if [ -f "$SERVICE_REQUIREMENTS" ]; then
+            SERVICE_REQUIREMENTS_DIR=$(dirname "$SERVICE_REQUIREMENTS")
+            SERVICE_REQUIREMENTS_FILE=$(basename "$SERVICE_REQUIREMENTS")
+            (cd "$SERVICE_REQUIREMENTS_DIR" && pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS_FILE")
+          fi
 
 
       - name: 同步书单
@@ -1104,13 +1232,31 @@ jobs:
       WEREAD_CONFIG: ${{ secrets.WEREAD_CONFIG }}
       NOTIONHUB_API_BASE: https://i.notionhub.app/v1
       NOTIONHUB_SERVICE: weread
-      NOTIONHUB_CONFIG_VERSION: '51'
+      NOTIONHUB_CONFIG_VERSION: '69'
       SYNC_POLICY_STATE_PATH: ${{ github.workspace }}/notionhub-state.json
       SYNC_POLICY_CONTINUATION_PATH: ${{ github.workspace }}/notionhub-continuation-id
       SYNC_POLICY_REPORT_PATH: ${{ github.workspace }}/notionhub-service-report.json
       NOTIONHUB_RUN_META_PATH: ${{ github.workspace }}/notionhub-run-meta.json
       NOTIONHUB_TARGET_RESULTS_PATH: ${{ github.workspace }}/notionhub-target-results.json
     steps:
+      - name: 清理历史同步临时文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${GITHUB_WORKSPACE:?GitHub workspace is required}"
+          rm -f -- \
+            "$GITHUB_WORKSPACE/notionhub-state.json" \
+            "$GITHUB_WORKSPACE/notionhub-continuation-id" \
+            "$GITHUB_WORKSPACE/notionhub-run-meta.json" \
+            "$GITHUB_WORKSPACE/notionhub-target-results.json" \
+            "$GITHUB_WORKSPACE/notionhub-service-report.json" \
+            "$GITHUB_WORKSPACE/notionhub-final.json"
+          shopt -s nullglob
+          for STAGE_FILE in "$GITHUB_WORKSPACE"/notionhub-stage-*.json; do
+            rm -f -- "$STAGE_FILE"
+          done
+          rm -rf -- "$GITHUB_WORKSPACE/notionhub-artifacts"
+
       - name: 恢复上一阶段进度
         id: restore
         if: needs.books.outputs.enabled == 'true' && needs.booklists.result == 'success'
@@ -1247,24 +1393,42 @@ jobs:
         continue-on-error: true
         if: steps.job_config.outputs.enabled == 'true'
         run: |
-          OIDC_TOKEN=$(curl -fsSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty')
-          if [ -z "$OIDC_TOKEN" ]; then
-            echo "::error title=GitHub 身份验证失败::未能获取本次运行的 OIDC token。"
-            exit 1
-          fi
-          echo "::add-mask::$OIDC_TOKEN"
-          CONTINUATION_ID="$(cat "$SYNC_POLICY_CONTINUATION_PATH")"
-          if [ -z "$CONTINUATION_ID" ]; then
+          CONTINUATION_TOKEN="$(cat "$SYNC_POLICY_CONTINUATION_PATH")"
+          if [ -z "$CONTINUATION_TOKEN" ]; then
             echo "::error title=运行授权续接失败::同步进度中缺少续接标识。"
             exit 1
           fi
-          RUNTIME_PAYLOAD=$(jq -cn --arg service "weread" --arg continuation "$CONTINUATION_ID" '{service:$service,purpose:"sync",continuationPolicyId:$continuation}')
+          RUNTIME_PAYLOAD=$(jq -cn --arg service "weread" --arg continuation "$CONTINUATION_TOKEN" '{service:$service,purpose:"sync",continuationToken:$continuation}')
           RUNTIME_RESPONSE="$RUNNER_TEMP/notionhub-runtime-bundle.bin"
           RUNTIME_METADATA="$RUNNER_TEMP/notionhub-runtime-metadata.json"
           RUNTIME_ARCHIVE="$RUNNER_TEMP/notionhub-runner.tar.gz"
           cleanup_runtime_files() { rm -f "$RUNTIME_RESPONSE" "$RUNTIME_METADATA" "$RUNTIME_ARCHIVE"; }
           trap cleanup_runtime_files EXIT
-          HTTP_STATUS=$(curl -sS -o "$RUNTIME_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/runtime-bundle"             -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' --data "$RUNTIME_PAYLOAD")
+          # GitHub OIDC tokens are single-use at the Worker. Never let a
+          # transport retry reuse a token that may already have been consumed
+          # by a request whose response was lost after the server accepted it.
+          HTTP_STATUS=000
+          for ATTEMPT in 1 2 3 4; do
+            OIDC_TOKEN=$(curl -fsSL --max-time 30 -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty') || OIDC_TOKEN=""
+            if [ -n "$OIDC_TOKEN" ]; then
+              echo "::add-mask::$OIDC_TOKEN"
+              HTTP_STATUS=$(curl -sS --max-time 120 -o "$RUNTIME_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/runtime-bundle"                 -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' --data "$RUNTIME_PAYLOAD") || HTTP_STATUS=000
+              unset OIDC_TOKEN
+            else
+              HTTP_STATUS=000
+            fi
+            case "$HTTP_STATUS" in
+              2??) break ;;
+              408|429|5??|000)
+                if [ "$ATTEMPT" -lt 4 ]; then sleep $((ATTEMPT * 2)); fi
+                ;;
+              4??|*) break ;;
+            esac
+          done
+          if [ "$HTTP_STATUS" = "000" ]; then
+            echo "::error title=运行准备失败::无法获取 GitHub OIDC token 或连接运行服务。"
+            exit 1
+          fi
           if [ "$HTTP_STATUS" = "418" ]; then
             echo "免费体验次数已用完，请购买激活码。"
             echo "获取激活码：https://www.notionhub.app/docs/get-activation-code.html"
@@ -1324,6 +1488,7 @@ jobs:
           PY
           ACCESS_TOKEN=$(jq -r '.accessToken // empty' "$RUNTIME_METADATA")
           REPORT_TOKEN=$(jq -r '.reportToken // empty' "$RUNTIME_METADATA")
+          CONTINUATION_TOKEN=$(jq -r '.continuationToken // empty' "$RUNTIME_METADATA")
           POLICY_ID=$(jq -r '.context.id // empty' "$RUNTIME_METADATA")
           PLAN=$(jq -r '.context.plan // empty' "$RUNTIME_METADATA")
           POLICY_JSON=$(jq -c '.policy // {}' "$RUNTIME_METADATA")
@@ -1331,11 +1496,13 @@ jobs:
           SERVICE_CONFIG=$(jq -c '.serviceConfig // empty' "$RUNTIME_METADATA")
           EXPECTED_SIZE=$(jq -r '.bundle.size // empty' "$RUNTIME_METADATA")
           EXPECTED_SHA256=$(jq -r '.bundle.sha256 // empty' "$RUNTIME_METADATA")
-          if [ -z "$ACCESS_TOKEN" ] || [ -z "$REPORT_TOKEN" ] || [ -z "$POLICY_ID" ] || [ -z "$PLAN" ] || [ -z "$POLICY_SIGNATURE" ] || [ -z "$SERVICE_CONFIG" ] || [ -z "$EXPECTED_SIZE" ] || [ -z "$EXPECTED_SHA256" ]; then
+          if [ -z "$ACCESS_TOKEN" ] || [ -z "$REPORT_TOKEN" ] || [ -z "$CONTINUATION_TOKEN" ] || [ -z "$POLICY_ID" ] || [ -z "$PLAN" ] || [ -z "$POLICY_SIGNATURE" ] || [ -z "$SERVICE_CONFIG" ] || [ -z "$EXPECTED_SIZE" ] || [ -z "$EXPECTED_SHA256" ]; then
             echo "::error title=运行准备失败::运行配置缺少必要字段。"
             exit 1
           fi
-          for VALUE in "$ACCESS_TOKEN" "$REPORT_TOKEN" "$POLICY_SIGNATURE" "$SERVICE_CONFIG"; do echo "::add-mask::$VALUE"; done
+          for VALUE in "$ACCESS_TOKEN" "$REPORT_TOKEN" "$CONTINUATION_TOKEN" "$POLICY_SIGNATURE" "$SERVICE_CONFIG"; do echo "::add-mask::$VALUE"; done
+          printf '%s' "$CONTINUATION_TOKEN" > "$SYNC_POLICY_CONTINUATION_PATH"
+          chmod 600 "$SYNC_POLICY_CONTINUATION_PATH"
           python3 - "$RUNTIME_METADATA" <<'PY'
           import json
           import sys
@@ -1390,7 +1557,11 @@ jobs:
           python -m pip install --quiet --disable-pip-version-check --upgrade pip
           if [ -f runner/requirements.txt ]; then pip install --quiet --disable-pip-version-check -r runner/requirements.txt; fi
           SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements weread)
-          if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
+          if [ -f "$SERVICE_REQUIREMENTS" ]; then
+            SERVICE_REQUIREMENTS_DIR=$(dirname "$SERVICE_REQUIREMENTS")
+            SERVICE_REQUIREMENTS_FILE=$(basename "$SERVICE_REQUIREMENTS")
+            (cd "$SERVICE_REQUIREMENTS_DIR" && pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS_FILE")
+          fi
 
 
       - name: 同步公众号文章
@@ -1482,13 +1653,31 @@ jobs:
       WEREAD_CONFIG: ${{ secrets.WEREAD_CONFIG }}
       NOTIONHUB_API_BASE: https://i.notionhub.app/v1
       NOTIONHUB_SERVICE: weread
-      NOTIONHUB_CONFIG_VERSION: '51'
+      NOTIONHUB_CONFIG_VERSION: '69'
       SYNC_POLICY_STATE_PATH: ${{ github.workspace }}/notionhub-state.json
       SYNC_POLICY_CONTINUATION_PATH: ${{ github.workspace }}/notionhub-continuation-id
       SYNC_POLICY_REPORT_PATH: ${{ github.workspace }}/notionhub-service-report.json
       NOTIONHUB_RUN_META_PATH: ${{ github.workspace }}/notionhub-run-meta.json
       NOTIONHUB_TARGET_RESULTS_PATH: ${{ github.workspace }}/notionhub-target-results.json
     steps:
+      - name: 清理历史同步临时文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${GITHUB_WORKSPACE:?GitHub workspace is required}"
+          rm -f -- \
+            "$GITHUB_WORKSPACE/notionhub-state.json" \
+            "$GITHUB_WORKSPACE/notionhub-continuation-id" \
+            "$GITHUB_WORKSPACE/notionhub-run-meta.json" \
+            "$GITHUB_WORKSPACE/notionhub-target-results.json" \
+            "$GITHUB_WORKSPACE/notionhub-service-report.json" \
+            "$GITHUB_WORKSPACE/notionhub-final.json"
+          shopt -s nullglob
+          for STAGE_FILE in "$GITHUB_WORKSPACE"/notionhub-stage-*.json; do
+            rm -f -- "$STAGE_FILE"
+          done
+          rm -rf -- "$GITHUB_WORKSPACE/notionhub-artifacts"
+
       - name: 恢复上一阶段进度
         id: restore
         if: needs.books.outputs.enabled == 'true' && needs.mp_articles.result == 'success'
@@ -1604,24 +1793,42 @@ jobs:
         continue-on-error: true
         if: steps.job_config.outputs.enabled == 'true'
         run: |
-          OIDC_TOKEN=$(curl -fsSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty')
-          if [ -z "$OIDC_TOKEN" ]; then
-            echo "::error title=GitHub 身份验证失败::未能获取本次运行的 OIDC token。"
-            exit 1
-          fi
-          echo "::add-mask::$OIDC_TOKEN"
-          CONTINUATION_ID="$(cat "$SYNC_POLICY_CONTINUATION_PATH")"
-          if [ -z "$CONTINUATION_ID" ]; then
+          CONTINUATION_TOKEN="$(cat "$SYNC_POLICY_CONTINUATION_PATH")"
+          if [ -z "$CONTINUATION_TOKEN" ]; then
             echo "::error title=运行授权续接失败::同步进度中缺少续接标识。"
             exit 1
           fi
-          RUNTIME_PAYLOAD=$(jq -cn --arg service "weread" --arg continuation "$CONTINUATION_ID" '{service:$service,purpose:"sync",continuationPolicyId:$continuation}')
+          RUNTIME_PAYLOAD=$(jq -cn --arg service "weread" --arg continuation "$CONTINUATION_TOKEN" '{service:$service,purpose:"sync",continuationToken:$continuation}')
           RUNTIME_RESPONSE="$RUNNER_TEMP/notionhub-runtime-bundle.bin"
           RUNTIME_METADATA="$RUNNER_TEMP/notionhub-runtime-metadata.json"
           RUNTIME_ARCHIVE="$RUNNER_TEMP/notionhub-runner.tar.gz"
           cleanup_runtime_files() { rm -f "$RUNTIME_RESPONSE" "$RUNTIME_METADATA" "$RUNTIME_ARCHIVE"; }
           trap cleanup_runtime_files EXIT
-          HTTP_STATUS=$(curl -sS -o "$RUNTIME_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/runtime-bundle"             -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' --data "$RUNTIME_PAYLOAD")
+          # GitHub OIDC tokens are single-use at the Worker. Never let a
+          # transport retry reuse a token that may already have been consumed
+          # by a request whose response was lost after the server accepted it.
+          HTTP_STATUS=000
+          for ATTEMPT in 1 2 3 4; do
+            OIDC_TOKEN=$(curl -fsSL --max-time 30 -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty') || OIDC_TOKEN=""
+            if [ -n "$OIDC_TOKEN" ]; then
+              echo "::add-mask::$OIDC_TOKEN"
+              HTTP_STATUS=$(curl -sS --max-time 120 -o "$RUNTIME_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/runtime-bundle"                 -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' --data "$RUNTIME_PAYLOAD") || HTTP_STATUS=000
+              unset OIDC_TOKEN
+            else
+              HTTP_STATUS=000
+            fi
+            case "$HTTP_STATUS" in
+              2??) break ;;
+              408|429|5??|000)
+                if [ "$ATTEMPT" -lt 4 ]; then sleep $((ATTEMPT * 2)); fi
+                ;;
+              4??|*) break ;;
+            esac
+          done
+          if [ "$HTTP_STATUS" = "000" ]; then
+            echo "::error title=运行准备失败::无法获取 GitHub OIDC token 或连接运行服务。"
+            exit 1
+          fi
           if [ "$HTTP_STATUS" = "418" ]; then
             echo "免费体验次数已用完，请购买激活码。"
             echo "获取激活码：https://www.notionhub.app/docs/get-activation-code.html"
@@ -1681,6 +1888,7 @@ jobs:
           PY
           ACCESS_TOKEN=$(jq -r '.accessToken // empty' "$RUNTIME_METADATA")
           REPORT_TOKEN=$(jq -r '.reportToken // empty' "$RUNTIME_METADATA")
+          CONTINUATION_TOKEN=$(jq -r '.continuationToken // empty' "$RUNTIME_METADATA")
           POLICY_ID=$(jq -r '.context.id // empty' "$RUNTIME_METADATA")
           PLAN=$(jq -r '.context.plan // empty' "$RUNTIME_METADATA")
           POLICY_JSON=$(jq -c '.policy // {}' "$RUNTIME_METADATA")
@@ -1688,11 +1896,13 @@ jobs:
           SERVICE_CONFIG=$(jq -c '.serviceConfig // empty' "$RUNTIME_METADATA")
           EXPECTED_SIZE=$(jq -r '.bundle.size // empty' "$RUNTIME_METADATA")
           EXPECTED_SHA256=$(jq -r '.bundle.sha256 // empty' "$RUNTIME_METADATA")
-          if [ -z "$ACCESS_TOKEN" ] || [ -z "$REPORT_TOKEN" ] || [ -z "$POLICY_ID" ] || [ -z "$PLAN" ] || [ -z "$POLICY_SIGNATURE" ] || [ -z "$SERVICE_CONFIG" ] || [ -z "$EXPECTED_SIZE" ] || [ -z "$EXPECTED_SHA256" ]; then
+          if [ -z "$ACCESS_TOKEN" ] || [ -z "$REPORT_TOKEN" ] || [ -z "$CONTINUATION_TOKEN" ] || [ -z "$POLICY_ID" ] || [ -z "$PLAN" ] || [ -z "$POLICY_SIGNATURE" ] || [ -z "$SERVICE_CONFIG" ] || [ -z "$EXPECTED_SIZE" ] || [ -z "$EXPECTED_SHA256" ]; then
             echo "::error title=运行准备失败::运行配置缺少必要字段。"
             exit 1
           fi
-          for VALUE in "$ACCESS_TOKEN" "$REPORT_TOKEN" "$POLICY_SIGNATURE" "$SERVICE_CONFIG"; do echo "::add-mask::$VALUE"; done
+          for VALUE in "$ACCESS_TOKEN" "$REPORT_TOKEN" "$CONTINUATION_TOKEN" "$POLICY_SIGNATURE" "$SERVICE_CONFIG"; do echo "::add-mask::$VALUE"; done
+          printf '%s' "$CONTINUATION_TOKEN" > "$SYNC_POLICY_CONTINUATION_PATH"
+          chmod 600 "$SYNC_POLICY_CONTINUATION_PATH"
           python3 - "$RUNTIME_METADATA" <<'PY'
           import json
           import sys
@@ -1747,7 +1957,11 @@ jobs:
           python -m pip install --quiet --disable-pip-version-check --upgrade pip
           if [ -f runner/requirements.txt ]; then pip install --quiet --disable-pip-version-check -r runner/requirements.txt; fi
           SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements weread)
-          if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
+          if [ -f "$SERVICE_REQUIREMENTS" ]; then
+            SERVICE_REQUIREMENTS_DIR=$(dirname "$SERVICE_REQUIREMENTS")
+            SERVICE_REQUIREMENTS_FILE=$(basename "$SERVICE_REQUIREMENTS")
+            (cd "$SERVICE_REQUIREMENTS_DIR" && pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS_FILE")
+          fi
 
 
       - name: 修复 Notion 数据
@@ -2042,24 +2256,42 @@ jobs:
         id: finish_authorize
         if: always() && steps.finish_auth.outputs.enabled == 'true'
         run: |
-          OIDC_TOKEN=$(curl -fsSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty')
-          if [ -z "$OIDC_TOKEN" ]; then
-            echo "::error title=GitHub 身份验证失败::未能获取本次运行的 OIDC token。"
-            exit 1
-          fi
-          echo "::add-mask::$OIDC_TOKEN"
-          CONTINUATION_ID="$(cat "$SYNC_POLICY_CONTINUATION_PATH")"
-          if [ -z "$CONTINUATION_ID" ]; then
+          CONTINUATION_TOKEN="$(cat "$SYNC_POLICY_CONTINUATION_PATH")"
+          if [ -z "$CONTINUATION_TOKEN" ]; then
             echo "::error title=运行授权续接失败::同步进度中缺少续接标识。"
             exit 1
           fi
-          RUNTIME_PAYLOAD=$(jq -cn --arg service "weread" --arg continuation "$CONTINUATION_ID" '{service:$service,purpose:"sync",continuationPolicyId:$continuation}')
+          RUNTIME_PAYLOAD=$(jq -cn --arg service "weread" --arg continuation "$CONTINUATION_TOKEN" '{service:$service,purpose:"sync",continuationToken:$continuation}')
           RUNTIME_RESPONSE="$RUNNER_TEMP/notionhub-runtime-bundle.bin"
           RUNTIME_METADATA="$RUNNER_TEMP/notionhub-runtime-metadata.json"
           RUNTIME_ARCHIVE="$RUNNER_TEMP/notionhub-runner.tar.gz"
           cleanup_runtime_files() { rm -f "$RUNTIME_RESPONSE" "$RUNTIME_METADATA" "$RUNTIME_ARCHIVE"; }
           trap cleanup_runtime_files EXIT
-          HTTP_STATUS=$(curl -sS -o "$RUNTIME_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/runtime-bundle"             -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' --data "$RUNTIME_PAYLOAD")
+          # GitHub OIDC tokens are single-use at the Worker. Never let a
+          # transport retry reuse a token that may already have been consumed
+          # by a request whose response was lost after the server accepted it.
+          HTTP_STATUS=000
+          for ATTEMPT in 1 2 3 4; do
+            OIDC_TOKEN=$(curl -fsSL --max-time 30 -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty') || OIDC_TOKEN=""
+            if [ -n "$OIDC_TOKEN" ]; then
+              echo "::add-mask::$OIDC_TOKEN"
+              HTTP_STATUS=$(curl -sS --max-time 120 -o "$RUNTIME_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/runtime-bundle"                 -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' --data "$RUNTIME_PAYLOAD") || HTTP_STATUS=000
+              unset OIDC_TOKEN
+            else
+              HTTP_STATUS=000
+            fi
+            case "$HTTP_STATUS" in
+              2??) break ;;
+              408|429|5??|000)
+                if [ "$ATTEMPT" -lt 4 ]; then sleep $((ATTEMPT * 2)); fi
+                ;;
+              4??|*) break ;;
+            esac
+          done
+          if [ "$HTTP_STATUS" = "000" ]; then
+            echo "::error title=运行准备失败::无法获取 GitHub OIDC token 或连接运行服务。"
+            exit 1
+          fi
           if [ "$HTTP_STATUS" = "418" ]; then
             echo "免费体验次数已用完，请购买激活码。"
             echo "获取激活码：https://www.notionhub.app/docs/get-activation-code.html"
@@ -2119,6 +2351,7 @@ jobs:
           PY
           ACCESS_TOKEN=$(jq -r '.accessToken // empty' "$RUNTIME_METADATA")
           REPORT_TOKEN=$(jq -r '.reportToken // empty' "$RUNTIME_METADATA")
+          CONTINUATION_TOKEN=$(jq -r '.continuationToken // empty' "$RUNTIME_METADATA")
           POLICY_ID=$(jq -r '.context.id // empty' "$RUNTIME_METADATA")
           PLAN=$(jq -r '.context.plan // empty' "$RUNTIME_METADATA")
           POLICY_JSON=$(jq -c '.policy // {}' "$RUNTIME_METADATA")
@@ -2126,11 +2359,13 @@ jobs:
           SERVICE_CONFIG=$(jq -c '.serviceConfig // empty' "$RUNTIME_METADATA")
           EXPECTED_SIZE=$(jq -r '.bundle.size // empty' "$RUNTIME_METADATA")
           EXPECTED_SHA256=$(jq -r '.bundle.sha256 // empty' "$RUNTIME_METADATA")
-          if [ -z "$ACCESS_TOKEN" ] || [ -z "$REPORT_TOKEN" ] || [ -z "$POLICY_ID" ] || [ -z "$PLAN" ] || [ -z "$POLICY_SIGNATURE" ] || [ -z "$SERVICE_CONFIG" ] || [ -z "$EXPECTED_SIZE" ] || [ -z "$EXPECTED_SHA256" ]; then
+          if [ -z "$ACCESS_TOKEN" ] || [ -z "$REPORT_TOKEN" ] || [ -z "$CONTINUATION_TOKEN" ] || [ -z "$POLICY_ID" ] || [ -z "$PLAN" ] || [ -z "$POLICY_SIGNATURE" ] || [ -z "$SERVICE_CONFIG" ] || [ -z "$EXPECTED_SIZE" ] || [ -z "$EXPECTED_SHA256" ]; then
             echo "::error title=运行准备失败::运行配置缺少必要字段。"
             exit 1
           fi
-          for VALUE in "$ACCESS_TOKEN" "$REPORT_TOKEN" "$POLICY_SIGNATURE" "$SERVICE_CONFIG"; do echo "::add-mask::$VALUE"; done
+          for VALUE in "$ACCESS_TOKEN" "$REPORT_TOKEN" "$CONTINUATION_TOKEN" "$POLICY_SIGNATURE" "$SERVICE_CONFIG"; do echo "::add-mask::$VALUE"; done
+          printf '%s' "$CONTINUATION_TOKEN" > "$SYNC_POLICY_CONTINUATION_PATH"
+          chmod 600 "$SYNC_POLICY_CONTINUATION_PATH"
           python3 - "$RUNTIME_METADATA" <<'PY'
           import json
           import sys
